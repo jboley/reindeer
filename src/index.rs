@@ -10,9 +10,8 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
-use anyhow::Context as _;
-use anyhow::Result;
 use serde::Deserialize;
 
 use crate::buck::Name;
@@ -33,10 +32,8 @@ pub struct Index<'meta> {
     pkgid_to_pkg: HashMap<&'meta PkgId, &'meta Manifest>,
     /// Map a PkgId to a Node (ie all the details of a resolve dependency)
     pkgid_to_node: HashMap<&'meta PkgId, &'meta Node>,
-    /// Represents the Cargo.toml itself, if not a virtual manifest.
-    pub root_pkg: Option<&'meta Manifest>,
-    /// All packages considered part of the workspace.
-    pub workspace_members: Vec<&'meta Manifest>,
+    /// Represents the Cargo.toml itself
+    pub root_pkg: &'meta Manifest,
     /// Set of packages from which at least one target is public.
     public_packages: BTreeSet<&'meta PkgId>,
     /// Set of public targets. These consist of:
@@ -63,46 +60,30 @@ impl<'meta> Index<'meta> {
     /// Construct an index for a set of Cargo metadata to allow convenient and efficient
     /// queries. The metadata represents a top level package and all its transitive
     /// dependencies.
-    pub fn new(root_is_real: bool, metadata: &'meta Metadata) -> Result<Index<'meta>> {
+    pub fn new(root_is_real: bool, metadata: &'meta Metadata) -> Index<'meta> {
         let pkgid_to_pkg: HashMap<_, _> = metadata.packages.iter().map(|m| (&m.id, m)).collect();
 
-        let root_pkg = metadata.resolve.root.as_ref().map(|root_pkgid| {
-            *pkgid_to_pkg
-                .get(root_pkgid)
-                .expect("couldn't identify unambiguous top-level crate")
-        });
+        let root_pkg: &Manifest = pkgid_to_pkg
+            .get(&metadata.resolve.root.as_ref().expect("missing root pkg"))
+            .expect("couldn't identify unambiguous top-level crate");
 
-        let top_levels = if root_is_real {
-            Some(
-                &root_pkg
-                    .context("`include_top_level = true` is not supported on a virtual manifest")?
-                    .id,
-            )
-        } else {
-            None
-        };
-
-        let workspace_members = metadata
-            .workspace_default_members
-            .iter()
-            .filter_map(|pkgid| pkgid_to_pkg.get(pkgid).copied())
-            .collect();
+        let mut top_levels = HashSet::new();
+        if root_is_real {
+            top_levels.insert(&root_pkg.id);
+        }
 
         let mut tmp = Index {
             pkgid_to_pkg,
             pkgid_to_node: metadata.resolve.nodes.iter().map(|n| (&n.id, n)).collect(),
             root_pkg,
-            workspace_members,
             public_packages: BTreeSet::new(),
             public_targets: BTreeMap::new(),
         };
 
-        // Keep an index of renamed crates, mapping from _ normalized name to actual name.
-        // Only the root package's renames matter. We don't attempt to merge different
-        // rename choices made by different workspace members.
+        // Keep an index of renamed crates, mapping from _ normalized name to actual name
         let dep_renamed: HashMap<String, &'meta str> = root_pkg
+            .dependencies
             .iter()
-            .flat_map(|root_pkg| &root_pkg.dependencies)
             .filter_map(|dep| {
                 let rename = dep.rename.as_deref()?;
                 Some((rename.replace('-', "_"), rename))
@@ -110,11 +91,9 @@ impl<'meta> Index<'meta> {
             .collect();
 
         // Compute public set, with pkgid mapped to rename if it has one. Public set is
-        // anything in top_levels, or first-order dependencies of any workspace member.
+        // anything in top_levels, or first-order dependencies of root_pkg.
         let public_targets = tmp
-            .workspace_members
-            .iter()
-            .flat_map(|member| tmp.resolved_deps(member))
+            .resolved_deps(tmp.root_pkg)
             .flat_map(|(rename, dep_kind, pkg)| {
                 let target_req = dep_kind.target_req();
                 let opt_rename = dep_renamed.get(rename).cloned();
@@ -132,18 +111,15 @@ impl<'meta> Index<'meta> {
             tmp.public_packages.insert(pkg);
         }
 
-        Ok(Index {
+        Index {
             public_targets,
             ..tmp
-        })
+        }
     }
 
     /// Test if a package is the root package
     pub fn is_root_package(&self, pkg: &Manifest) -> bool {
-        match self.root_pkg {
-            Some(root_pkg) => root_pkg.id == pkg.id,
-            None => false,
-        }
+        self.root_pkg.id == pkg.id
     }
 
     /// Test if there is any target from the package which is public
